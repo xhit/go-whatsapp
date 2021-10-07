@@ -10,10 +10,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Rhymen/go-whatsapp/binary"
-	"github.com/Rhymen/go-whatsapp/crypto/cbc"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
+	"github.com/xhit/go-whatsapp/binary"
+	"github.com/xhit/go-whatsapp/crypto/cbc"
 )
 
 func (wac *Conn) readPump() {

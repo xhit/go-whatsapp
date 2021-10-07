@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Rhymen/go-whatsapp/binary"
+	"github.com/xhit/go-whatsapp/binary"
 )
 
 type Presence string
