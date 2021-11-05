@@ -162,86 +162,115 @@ func (wac *Conn) GetClientVersion() []int {
 	return waVersion
 }
 
-/*
-Login is the function that creates a new whatsapp session and logs you in. If you do not want to scan the qr code
-every time, you should save the returned session and use RestoreWithSession the next time. Login takes a writable channel
-as an parameter. This channel is used to push the data represented by the qr code back to the user. The received data
-should be displayed as an qr code in a way you prefer. To print a qr code to console you can use:
-github.com/Baozisoftware/qrcode-terminal-go Example login procedure:
-	wac, err := whatsapp.NewConn(5 * time.Second)
-	if err != nil {
-		panic(err)
-	}
+// QR info needed to login
+type QRInfo struct {
+	session Session
+	QR      string
+	priv    *[32]byte
+	RespTTL float64
+}
 
-	qr := make(chan string)
-	go func() {
-		terminal := qrcodeTerminal.New()
-		terminal.Get(<-qr).Print()
-	}()
-
-	session, err := wac.Login(qr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error during login: %v\n", err)
-	}
-	fmt.Printf("login successful, session: %v\n", session)
-*/
-func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
+// GetQR get the QR to connect to Whatsapp
+func (wac *Conn) GetQR() (QRInfo, error) {
 	session := Session{}
 	//Makes sure that only a single Login or Restore can happen at the same time
 	if !atomic.CompareAndSwapUint32(&wac.sessionLock, 0, 1) {
-		return session, ErrLoginInProgress
+		return QRInfo{}, ErrLoginInProgress
 	}
 	defer atomic.StoreUint32(&wac.sessionLock, 0)
 
 	if wac.loggedIn {
-		return session, ErrAlreadyLoggedIn
+		return QRInfo{}, ErrAlreadyLoggedIn
 	}
 
 	if err := wac.connect(); err != nil && err != ErrAlreadyConnected {
-		return session, err
+		return QRInfo{}, err
 	}
 
 	//logged in?!?
 	if wac.session != nil && (wac.session.EncKey != nil || wac.session.MacKey != nil) {
-		return session, fmt.Errorf("already logged in")
+		return QRInfo{}, fmt.Errorf("already logged in")
 	}
 
 	clientId := make([]byte, 16)
 	_, err := rand.Read(clientId)
 	if err != nil {
-		return session, fmt.Errorf("error creating random ClientId: %v", err)
+		return QRInfo{}, fmt.Errorf("error creating random ClientId: %v", err)
 	}
 
 	session.ClientId = base64.StdEncoding.EncodeToString(clientId)
 	login := []interface{}{"admin", "init", waVersion, []string{wac.longClientName, wac.shortClientName, wac.clientVersion}, session.ClientId, true}
 	loginChan, err := wac.writeJson(login)
 	if err != nil {
-		return session, fmt.Errorf("error writing login: %v\n", err)
+		return QRInfo{}, fmt.Errorf("error writing login: %v\n", err)
 	}
 
 	var r string
 	select {
 	case r = <-loginChan:
 	case <-time.After(wac.msgTimeout):
-		return session, fmt.Errorf("login connection timed out")
+		return QRInfo{}, fmt.Errorf("login connection timed out")
 	}
 
 	var resp map[string]interface{}
 	if err = json.Unmarshal([]byte(r), &resp); err != nil {
-		return session, fmt.Errorf("error decoding login resp: %v\n", err)
+		return QRInfo{}, fmt.Errorf("error decoding login resp: %v\n", err)
 	}
 
 	var ref string
 	if rref, ok := resp["ref"].(string); ok {
 		ref = rref
 	} else {
-		return session, fmt.Errorf("error decoding login resp: invalid resp['ref']\n")
+		return QRInfo{}, fmt.Errorf("error decoding login resp: invalid resp['ref']")
 	}
 
 	priv, pub, err := curve25519.GenerateKey()
 	if err != nil {
-		return session, fmt.Errorf("error generating keys: %v\n", err)
+		return QRInfo{}, fmt.Errorf("error generating keys: %v", err)
 	}
+
+	qrInfo := QRInfo{
+		QR:      fmt.Sprintf("%v,%v,%v", ref, base64.StdEncoding.EncodeToString(pub[:]), session.ClientId),
+		session: session,
+		priv:    priv,
+		RespTTL: resp["ttl"].(float64),
+	}
+
+	return qrInfo, nil
+}
+
+/*
+Login is the function that creates a new whatsapp session and logs you in. If you do not want to scan the qr code
+every time, you should save the returned session and use RestoreWithSession the next time. Login takes a writable channel
+as an parameter. To print a qr code to console you can use:
+github.com/Baozisoftware/qrcode-terminal-go
+
+Example login procedure:
+
+	qrInfo, err := wac.GetQR()
+	if err != nil {
+		panic(err)
+	}
+
+	png, err := qrcode.Encode(qrInfo.QR, qrcode.Medium, 256)
+	if err != nil {
+		panic(err)
+	}
+
+	f, err := os.OpenFile("qr.png", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		panic(err)
+	}
+	f.Write(png)
+
+	log.Printf("Esperando que se escanee QR, expira en %d segundos", int(qrInfo.RespTTL)/1000)
+	session, err = wac.Login(qrInfo)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("login successful, session: %v\n", session)
+*/
+func (wac *Conn) Login(qrInfo QRInfo) (Session, error) {
 
 	//listener for Login response
 	s1 := make(chan string, 1)
@@ -249,37 +278,35 @@ func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
 	wac.listener.m["s1"] = s1
 	wac.listener.Unlock()
 
-	qrChan <- fmt.Sprintf("%v,%v,%v", ref, base64.StdEncoding.EncodeToString(pub[:]), session.ClientId)
-
 	var resp2 []interface{}
 	select {
 	case r1 := <-s1:
 		wac.loginSessionLock.Lock()
 		defer wac.loginSessionLock.Unlock()
 		if err := json.Unmarshal([]byte(r1), &resp2); err != nil {
-			return session, fmt.Errorf("error decoding qr code resp: %v", err)
+			return qrInfo.session, fmt.Errorf("error decoding qr code resp: %v", err)
 		}
-	case <-time.After(time.Duration(resp["ttl"].(float64)) * time.Millisecond):
-		return session, fmt.Errorf("qr code scan timed out")
+	case <-time.After(time.Duration(qrInfo.RespTTL) * time.Millisecond):
+		return qrInfo.session, fmt.Errorf("qr code scan timed out")
 	}
 
 	info := resp2[1].(map[string]interface{})
 
 	wac.Info = newInfoFromReq(info)
 
-	session.ClientToken = info["clientToken"].(string)
-	session.ServerToken = info["serverToken"].(string)
-	session.Wid = info["wid"].(string)
+	qrInfo.session.ClientToken = info["clientToken"].(string)
+	qrInfo.session.ServerToken = info["serverToken"].(string)
+	qrInfo.session.Wid = info["wid"].(string)
 	s := info["secret"].(string)
 	decodedSecret, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return session, fmt.Errorf("error decoding secret: %v", err)
+		return qrInfo.session, fmt.Errorf("error decoding secret: %v", err)
 	}
 
 	var pubKey [32]byte
 	copy(pubKey[:], decodedSecret[:32])
 
-	sharedSecret := curve25519.GenerateSharedSecret(*priv, pubKey)
+	sharedSecret := curve25519.GenerateSharedSecret(*qrInfo.priv, pubKey)
 
 	hash := sha256.New
 
@@ -289,7 +316,7 @@ func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
 
 	sharedSecretExtended, err := hkdf.Expand(h.Sum(nil), 80, "")
 	if err != nil {
-		return session, fmt.Errorf("hkdf error: %v", err)
+		return qrInfo.session, fmt.Errorf("hkdf error: %v", err)
 	}
 
 	//login validation
@@ -299,7 +326,7 @@ func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
 	h2 := hmac.New(hash, sharedSecretExtended[32:64])
 	h2.Write(checkSecret)
 	if !hmac.Equal(h2.Sum(nil), decodedSecret[32:64]) {
-		return session, fmt.Errorf("abort login")
+		return qrInfo.session, fmt.Errorf("abort login")
 	}
 
 	keysEncrypted := make([]byte, 96)
@@ -308,15 +335,15 @@ func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
 
 	keyDecrypted, err := cbc.Decrypt(sharedSecretExtended[:32], nil, keysEncrypted)
 	if err != nil {
-		return session, fmt.Errorf("error decryptAes: %v", err)
+		return qrInfo.session, fmt.Errorf("error decryptAes: %v", err)
 	}
 
-	session.EncKey = keyDecrypted[:32]
-	session.MacKey = keyDecrypted[32:64]
-	wac.session = &session
+	qrInfo.session.EncKey = keyDecrypted[:32]
+	qrInfo.session.MacKey = keyDecrypted[32:64]
+	wac.session = &qrInfo.session
 	wac.loggedIn = true
 
-	return session, nil
+	return qrInfo.session, nil
 }
 
 //TODO: GoDoc
